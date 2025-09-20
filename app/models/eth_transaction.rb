@@ -7,6 +7,7 @@ class EthTransaction < T::Struct
   const :tx_hash, Hash32
   const :transaction_index, Integer
   const :input, ByteString
+  const :value, Integer
   const :chain_id, T.nilable(Integer)
   const :from_address, Address20
   const :to_address, T.nilable(Address20)
@@ -15,8 +16,11 @@ class EthTransaction < T::Struct
   const :eth_block, T.nilable(EthBlock)
   const :facet_transactions, T::Array[FacetTransaction], default: []
   
-  FACET_INBOX_ADDRESS = Address20.from_hex("0x00000000000000000000000000000000000face7")
-  FacetLogInboxEventSig = ByteString.from_hex("0x00000000000000000000000000000000000000000000000000000000000face7")
+  FACET_INBOX_ADDRESS     = Address20.from_hex(ENV.fetch('INBOX_ADDRESS', "0x00000000000000000000000000000000000face7"))
+  INBOX_FEE_WEI           = Integer(ENV.fetch('FEE_WEI', '0'))
+  FacetLogInboxEventSig   = ByteString.from_hex(ENV.fetch('FACET_EVENT_TOPIC', "0x00000000000000000000000000000000000000000000000000000000000face7"))
+  PaymentReceiptTopic0    = ByteString.from_hex(ENV.fetch('PAYMENT_RECEIPT_TOPIC0', "0x0"))
+
 
   sig { params(block_result: T.untyped, receipt_result: T.untyped).returns(T::Array[EthTransaction]) }
   def self.from_rpc_result(block_result, receipt_result)
@@ -40,6 +44,7 @@ class EthTransaction < T::Struct
         to_address: tx['to'] ? Address20.from_hex(tx['to']) : nil,
         status: current_receipt['status'].to_i(16),
         logs: current_receipt['logs'],
+        value: tx['value'].to_i(16),
       )
     end
   end
@@ -60,6 +65,7 @@ class EthTransaction < T::Struct
   sig { returns(T.nilable(FacetTransaction)) }
   def facet_tx_from_input
     return unless to_address == FACET_INBOX_ADDRESS
+    return unless value == INBOX_FEE_WEI
     
     FacetTransaction.from_payload(
       contract_initiated: false,
@@ -72,10 +78,15 @@ class EthTransaction < T::Struct
   sig { returns(T.nilable(FacetTransaction)) }
   def try_facet_tx_from_events
     facet_tx_creation_events.each do |log|
+      payload_bs  = ByteString.from_hex(log['data'])
+      payload_hash = payload_bs.keccak256.to_hex
+      if ENV.fetch('ENFORCE_EVENT_RECEIPT', 'true') == 'true'
+        next unless has_inbox_payment_receipt?(payload_hash)
+      end
       facet_tx = FacetTransaction.from_payload(
         contract_initiated: true,
         from_address: Address20.from_hex(log['address']),
-        eth_transaction_input: ByteString.from_hex(log['data']),
+        eth_transaction_input: payload_bs,
         tx_hash: tx_hash
       )
       return facet_tx if facet_tx
@@ -88,7 +99,36 @@ class EthTransaction < T::Struct
     status == 1
   end
   
-  sig { returns(T::Array[T.untyped]) }
+  sig { params(expected_payload_hash_hex: T.nilable(String)).returns(T::Boolean) }
+  def has_inbox_payment_receipt?(expected_payload_hash_hex)
+    logs.any? do |l|
+      next false if l['removed'] || !l['topics'] || l['topics'].empty?
+
+      begin
+        addr_ok = Address20.from_hex(l['address']) == FACET_INBOX_ADDRESS
+      rescue
+        addr_ok = false
+      end
+      next false unless addr_ok
+
+      topic0 = ByteString.from_hex(l['topics'].first)
+      next false unless topic0 == PaymentReceiptTopic0
+
+      data_hex = l['data']&.start_with?('0x') ? l['data'][2..-1] : l['data']
+      return false unless data_hex && data_hex.length >= 64*2
+
+      words = data_hex.scan(/.{1,64}/)
+      amount_hex        = '0x' + (words.length >= 3 ? words[-2] : words[0])
+      payload_hash_hex  = '0x' + (words.length >= 3 ? words[-1] : words[1])
+
+      amount     = amount_hex.to_i(16)
+      ok_amount  = (amount == INBOX_FEE_WEI)
+      ok_payload = expected_payload_hash_hex.nil? || (payload_hash_hex.downcase == expected_payload_hash_hex.downcase)
+
+      ok_amount && ok_payload
+    end
+  end
+
   def facet_tx_creation_events
     logs.select do |log|
       !log['removed'] && log['topics'].length == 1 &&
